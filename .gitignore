@@ -1,0 +1,4 @@
+.env
+paraview/results
+paraview/data
+results/

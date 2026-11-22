@@ -1,0 +1,14 @@
+services:
+  cfd:
+    build:
+      context: .
+    container_name: openfoam-cfd
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      - SPEED=30
+      - MAX_ITER=1000
+      - MESH_SCALE=0.001
+      # CASE_NAME, CHORD, WING_AREA, etc. as needed
+  

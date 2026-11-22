@@ -1,0 +1,25 @@
+services:
+  paraview:
+    image: nvcr.io/nvidia-hpcvis/paraview:egl-py3-5.11.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    volumes:
+      - ./results:/results
+      - ./scripts:/scripts
+
+    environment:
+      CASE_FILE: /results/aircraft/case.foam
+      OUTPUT_DIR: /results
+      FIELD: U
+      SLICE_AXIS: z
+
+    command: >
+      pvpython /scripts/visualize.py
+
+    shm_size: 8gb
