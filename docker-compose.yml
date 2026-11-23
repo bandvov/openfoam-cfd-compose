@@ -1,14 +1,41 @@
+# Settings are read from .env (copy .env.example to .env). Docker Compose uses
+# .env for ${VAR} substitution below; it does NOT inject .env into the container
+# by itself, so every variable run.py reads must be listed here.
 services:
   cfd:
     build:
       context: .
+      args:
+        OPENFOAM_IMAGE_TAG: ${OPENFOAM_IMAGE_TAG:-2506-oe2403sp2}
     container_name: openfoam-cfd
     working_dir: /workspace
     volumes:
       - ./:/workspace
     environment:
-      - SPEED=30
-      - MAX_ITER=1000
-      - MESH_SCALE=0.001
-      # CASE_NAME, CHORD, WING_AREA, etc. as needed
-  
+      CASE_NAME: ${CASE_NAME:-aircraft}
+      GEOMETRY: ${GEOMETRY:-/workspace/geometry/model.stl}
+      SPEED: ${SPEED:-30}
+      AIR_DENSITY: ${AIR_DENSITY:-1.225}
+      KINEMATIC_VISCOSITY: ${KINEMATIC_VISCOSITY:-1.5e-5}
+      CHORD: ${CHORD:-1.0}
+      WING_AREA: ${WING_AREA:-1.0}
+      TURBULENCE_INTENSITY: ${TURBULENCE_INTENSITY:-0.01}
+      MAX_ITER: ${MAX_ITER:-1000}
+      MODEL_UNITS: ${MODEL_UNITS:-mm}
+      MESH_SCALE: ${MESH_SCALE:-}
+      BACKGROUND_CELLS_PER_LENGTH: ${BACKGROUND_CELLS_PER_LENGTH:-16}
+      MAX_BACKGROUND_NX: ${MAX_BACKGROUND_NX:-100}
+      MAX_BACKGROUND_NY: ${MAX_BACKGROUND_NY:-70}
+      MAX_BACKGROUND_NZ: ${MAX_BACKGROUND_NZ:-60}
+      MAX_GLOBAL_CELLS: ${MAX_GLOBAL_CELLS:-2000000}
+      MAX_LOCAL_CELLS: ${MAX_LOCAL_CELLS:-1000000}
+      SURFACE_REFINEMENT_MIN: ${SURFACE_REFINEMENT_MIN:-1}
+      SURFACE_REFINEMENT_MAX: ${SURFACE_REFINEMENT_MAX:-2}
+      OPENFOAM_BASHRC: ${OPENFOAM_BASHRC:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]  

@@ -1,4 +1,4 @@
 .env
-paraview/results
-paraview/data
 results/
+__pycache__/
+*.pyc

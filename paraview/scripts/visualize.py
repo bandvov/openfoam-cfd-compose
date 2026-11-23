@@ -1,9 +1,7 @@
-
 #!/usr/bin/env pvpython
 
 from paraview.simple import *
 import os
-import sys
 
 # --------------------------------------------------
 # Configuration
@@ -64,7 +62,11 @@ def main():
     # 3. Select latest timestep
     # --------------------------------------------------
 
-    times = list(reader.TimestepValues)
+    times = reader.TimestepValues
+    # pvpython returns a bare float when there is only one timestep
+    if isinstance(times, (int, float)):
+        times = [times]
+    times = list(times)
 
     if times:
         latest_time = max(times)
@@ -97,6 +99,14 @@ def main():
 
     view.UseColorPaletteForBackground = 0
 
+    # Show the latest solution. Updating the reader alone is not enough:
+    # downstream filters and the screenshot use the view/animation time,
+    # which otherwise stays at the first timestep.
+    scene = GetAnimationScene()
+    scene.UpdateAnimationUsingDataTimeSteps()
+    scene.AnimationTime = latest_time
+    view.ViewTime = latest_time
+
     # --------------------------------------------------
     # 5. Create aircraft airflow cross-section
     # --------------------------------------------------
@@ -115,10 +125,16 @@ def main():
     # Y = spanwise
     # Z = vertical
 
-    if SLICE_AXIS == "x":
+    if SLICE_AXIS not in ("x", "y", "z"):
+        log(f"Unknown SLICE_AXIS '{SLICE_AXIS}', using z")
+        SLICE_AXIS_USED = "z"
+    else:
+        SLICE_AXIS_USED = SLICE_AXIS
+
+    if SLICE_AXIS_USED == "x":
         slice_filter.SliceType.Normal = [1, 0, 0]
 
-    elif SLICE_AXIS == "y":
+    elif SLICE_AXIS_USED == "y":
         slice_filter.SliceType.Normal = [0, 1, 0]
 
     else:
@@ -126,7 +142,7 @@ def main():
 
     slice_filter.SliceType.Origin = [0, 0, 0]
 
-    slice_filter.UpdatePipeline()
+    slice_filter.UpdatePipeline(time=latest_time)
 
     log("Slice created")
 
@@ -141,6 +157,9 @@ def main():
 
     display.Representation = "Surface"
 
+    if FIELD not in ("p", "U"):
+        log(f"Unknown FIELD '{FIELD}', using U")
+
     if FIELD == "p":
 
         ColorBy(
@@ -151,7 +170,8 @@ def main():
         lut = GetColorTransferFunction("p")
         lut.ApplyPreset("Cool to Warm", True)
 
-        title = "Static Pressure"
+        # simpleFoam solves kinematic pressure (p/rho)
+        title = "Kinematic pressure p/rho [m^2/s^2]"
 
         log("Displaying pressure field")
 
@@ -165,12 +185,14 @@ def main():
         lut = GetColorTransferFunction("U")
         lut.ApplyPreset("Cool to Warm", True)
 
-        title = "Velocity Magnitude"
+        title = "Velocity magnitude [m/s]"
 
         log("Displaying velocity magnitude")
 
     display.LookupTable = lut
+    display.RescaleTransferFunctionToDataRange(True, False)
     display.SetScalarBarVisibility(view, True)
+    GetScalarBar(lut, view).Title = title
 
     # --------------------------------------------------
     # 7. Camera
@@ -181,7 +203,7 @@ def main():
     view.CameraParallelProjection = 1
 
     # Top-down view for a horizontal cross-section.
-    if SLICE_AXIS == "z":
+    if SLICE_AXIS_USED == "z":
 
         bounds = slice_filter.GetDataInformation().GetBounds()
 
@@ -192,7 +214,7 @@ def main():
         view.CameraPosition = [cx, cy, 10]
         view.CameraViewUp = [0, 1, 0]
 
-    elif SLICE_AXIS == "y":
+    elif SLICE_AXIS_USED == "y":
 
         bounds = slice_filter.GetDataInformation().GetBounds()
 
@@ -201,6 +223,17 @@ def main():
 
         view.CameraFocalPoint = [cx, 0, cz]
         view.CameraPosition = [cx, -10, cz]
+        view.CameraViewUp = [0, 0, 1]
+
+    elif SLICE_AXIS_USED == "x":
+
+        bounds = slice_filter.GetDataInformation().GetBounds()
+
+        cy = (bounds[2] + bounds[3]) / 2
+        cz = (bounds[4] + bounds[5]) / 2
+
+        view.CameraFocalPoint = [0, cy, cz]
+        view.CameraPosition = [-10, cy, cz]
         view.CameraViewUp = [0, 0, 1]
 
     view.ResetCamera()
@@ -219,7 +252,7 @@ def main():
 
     output_file = os.path.join(
         OUTPUT_DIR,
-        f"aircraft_{FIELD}_{SLICE_AXIS}.png"
+        f"aircraft_{FIELD}_{SLICE_AXIS_USED}.png"
     )
 
     SaveScreenshot(

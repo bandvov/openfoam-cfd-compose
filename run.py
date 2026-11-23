@@ -35,7 +35,25 @@ CHORD = float(os.getenv("CHORD", "1.0"))
 AREA = float(os.getenv("WING_AREA", "1.0"))
 TI = float(os.getenv("TURBULENCE_INTENSITY", "0.01"))
 MAX_ITER = int(os.getenv("MAX_ITER", "3000"))
-MESH_SCALE = float(os.getenv("MESH_SCALE", "1.0"))
+# Units of the STL file. MODEL_UNITS picks the factor that converts them to
+# metres; MESH_SCALE (if set) overrides it with an explicit factor.
+UNIT_TO_METRES = {
+    "m": 1.0, "meter": 1.0, "metre": 1.0, "meters": 1.0, "metres": 1.0,
+    "mm": 1e-3, "millimeter": 1e-3, "millimetre": 1e-3,
+    "millimeters": 1e-3, "millimetres": 1e-3,
+    "cm": 1e-2, "centimeter": 1e-2, "centimetre": 1e-2,
+    "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
+    "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
+}
+MODEL_UNITS = os.getenv("MODEL_UNITS", "mm").strip().lower() or "m"
+if MODEL_UNITS not in UNIT_TO_METRES:
+    raise SystemExit(
+        f"ERROR: unknown MODEL_UNITS '{MODEL_UNITS}'. "
+        f"Use one of: m, mm, cm, in, ft (or set MESH_SCALE explicitly)."
+    )
+_scale_override = os.getenv("MESH_SCALE", "").strip()
+MESH_SCALE = (float(_scale_override) if _scale_override
+              else UNIT_TO_METRES[MODEL_UNITS])
 
 # Background mesh controls. These defaults keep the first test mesh modest.
 BACKGROUND_CELLS_PER_LENGTH = float(
@@ -49,8 +67,37 @@ MAX_LOCAL_CELLS = int(os.getenv("MAX_LOCAL_CELLS", "1000000"))
 SURFACE_REFINEMENT_MIN = int(os.getenv("SURFACE_REFINEMENT_MIN", "1"))
 SURFACE_REFINEMENT_MAX = int(os.getenv("SURFACE_REFINEMENT_MAX", "2"))
 
-# Typical location in the openeuler/openfoam:2506 image
-OPENFOAM_BASHRC = "/opt/OpenFOAM-v2506/etc/bashrc"
+
+
+def find_openfoam_bashrc() -> str:
+    """Locate OpenFOAM's etc/bashrc. Override with OPENFOAM_BASHRC if needed."""
+    explicit = os.getenv("OPENFOAM_BASHRC")
+    if explicit:
+        if not Path(explicit).is_file():
+            raise FileNotFoundError(f"OPENFOAM_BASHRC does not exist: {explicit}")
+        return explicit
+
+    candidates: list[Path] = []
+    project_dir = os.getenv("WM_PROJECT_DIR")
+    if project_dir:
+        candidates.append(Path(project_dir) / "etc" / "bashrc")
+    candidates += [
+        Path("/opt/OpenFOAM-v2506/etc/bashrc"),
+        Path("/usr/lib/openfoam/openfoam2506/etc/bashrc"),
+    ]
+    for pattern in ("/opt/OpenFOAM-v*/etc/bashrc",
+                    "/opt/openfoam*/etc/bashrc",
+                    "/usr/lib/openfoam/openfoam*/etc/bashrc"):
+        candidates += sorted(Path("/").glob(pattern.lstrip("/")))
+
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    raise FileNotFoundError(
+        "Could not find OpenFOAM's etc/bashrc. Set OPENFOAM_BASHRC to its path "
+        "(inside the container: find / -name bashrc -path '*openfoam*')."
+    )
+
 
 
 def run(command: str, log_name: str | None = None) -> None:
@@ -60,7 +107,7 @@ def run(command: str, log_name: str | None = None) -> None:
     # Fail if OpenFOAM's environment cannot be loaded. Silently ignoring a
     # failed bashrc can lead to confusing 'command not found' errors later.
     full_cmd = (
-        f"source '{OPENFOAM_BASHRC}' && "
+        f"source '{find_openfoam_bashrc()}' && "
         f"cd '{CASE}' && "
         f"{command}"
     )
@@ -115,6 +162,26 @@ def prepare_geometry():
             raise RuntimeError(
                 f"Could not read a triangle mesh from {GEOMETRY}")
         print(f"Loaded geometry: {GEOMETRY} ({len(mesh.faces)} triangles)")
+        mesh.apply_scale(MESH_SCALE)
+        print(f"Model units: {MODEL_UNITS} (scale to metres: {MESH_SCALE:g})")
+        if not mesh.is_watertight:
+            print("WARNING: STL is not watertight; snappyHexMesh may leak or "
+                  "produce a poor mesh. Repair the surface if meshing fails.",
+                  flush=True)
+        try:
+            # Needs scipy or networkx; skip this advisory check if missing.
+            n_bodies = len(mesh.split(only_watertight=False))
+            if n_bodies > 1:
+                print(f"WARNING: STL contains {n_bodies} disconnected bodies.",
+                      flush=True)
+        except Exception as exc:  # noqa: BLE001 - purely informational
+            print(f"Note: skipped disconnected-body check ({exc}).", flush=True)
+        lo, hi = mesh.bounds
+        if abs(hi[1]) < 1e-6 * max(mesh.extents) or abs(lo[1]) < 1e-6 * max(mesh.extents):
+            print("WARNING: geometry ends on the y=0 plane (looks like a half "
+                  "model). It is recentred and simulated as a full body in a "
+                  "box; it is NOT treated as a symmetry-plane half model.",
+                  flush=True)
     else:
         print(
             f"No STL found at {GEOMETRY}; creating a simple rectangular-wing test geometry.")
@@ -122,7 +189,6 @@ def prepare_geometry():
         mesh = trimesh.creation.box(
             extents=[CHORD, max(3.0 * CHORD, 1.0), 0.06 * CHORD])
 
-    mesh.apply_scale(MESH_SCALE)
     bounds = mesh.bounds.copy()
     centre = bounds.mean(axis=0)
     mesh.apply_translation(-centre)
@@ -134,11 +200,10 @@ def prepare_geometry():
     mesh.export(tri_dir / "aircraft.stl")
 
     ext = bounds[1] - bounds[0]
-    characteristic = max(float(ext[0]), float(
-        ext[1]), float(ext[2]), CHORD * MESH_SCALE)
     if min(ext) <= 0:
         raise RuntimeError(
             "Geometry has zero extent in at least one direction.")
+    characteristic = max(float(ext[0]), float(ext[1]), float(ext[2]))
     return bounds, ext, characteristic
 
 
@@ -366,8 +431,8 @@ functions
         pitchAxis       (0 1 0);
         CofR            (0 0 0);
         magUInf          {U_INF};
-        lRef             {CHORD * MESH_SCALE};
-        Aref             {AREA * MESH_SCALE * MESH_SCALE};
+        lRef             {CHORD};
+        Aref             {AREA};
         writeControl     timeStep;
         writeInterval    10;
     }}
@@ -444,8 +509,7 @@ relaxationFactors
 """)
 
     k = 1.5 * (U_INF * TI) ** 2
-    omega = math.sqrt(k) / (0.09 ** 0.25 *
-                            max(0.07 * CHORD * MESH_SCALE, 1e-4))
+    omega = math.sqrt(k) / (0.09 ** 0.25 * max(0.07 * CHORD, 1e-4))
 
     write("constant/turbulenceProperties", f"""
 {foam_header("dictionary", "turbulenceProperties")}
@@ -539,6 +603,11 @@ def main():
             "TURBULENCE_INTENSITY must be a fraction between 0 and 1.")
     if MAX_ITER <= 0:
         raise ValueError("MAX_ITER must be positive.")
+    if MESH_SCALE <= 0:
+        raise ValueError("MESH_SCALE must be positive.")
+    if U_INF > 100:
+        print("WARNING: SPEED > 100 m/s is outside the incompressible "
+              "(Mach < ~0.3) assumption of simpleFoam.", flush=True)
     if MAX_GLOBAL_CELLS <= 0 or MAX_LOCAL_CELLS <= 0:
         raise ValueError("Mesh cell limits must be positive.")
     if SURFACE_REFINEMENT_MIN < 0 or SURFACE_REFINEMENT_MAX < SURFACE_REFINEMENT_MIN:
@@ -564,22 +633,25 @@ def main():
     print(f"Maximum simpleFoam iterations: {MAX_ITER:,}", flush=True)
 
     print("\n=== OpenFOAM pipeline ===", flush=True)
+    (CASE / "case.foam").touch()
     run("blockMesh", "log.blockMesh")
     run("surfaceFeatureExtract", "log.surfaceFeatureExtract")
     run("snappyHexMesh -overwrite", "log.snappyHexMesh")
     run("checkMesh", "log.checkMesh")
     run("simpleFoam", "log.simpleFoam")
 
-    (CASE / "case.foam").touch()
     print("\nSimulation finished.")
     print(f"Case and fields: {CASE}")
     print(f"Force coefficients: {CASE / 'postProcessing' / 'forceCoeffs'}")
-    print("Open results/case.foam in ParaView to inspect pressure and velocity fields.")
+    print(f"Open results/{CASE_NAME}/case.foam in ParaView to inspect pressure and velocity fields.")
 
 
 if __name__ == "__main__":
     try:
         main()
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     except subprocess.CalledProcessError as exc:
         print(
             f"\nERROR: command failed with exit code {exc.returncode}", file=sys.stderr)

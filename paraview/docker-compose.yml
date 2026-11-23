@@ -1,3 +1,8 @@
+# Renders a slice screenshot from the CFD results. Run the solver first
+# (docker compose up --build in the repo root); it writes ../results/<CASE_NAME>/.
+# CASE_NAME / FIELD / SLICE_AXIS come from the shell or a paraview/.env file, e.g.
+#   CASE_NAME=run2 FIELD=p docker compose up
+# Needs an NVIDIA GPU + NVIDIA Container Toolkit and access to nvcr.io.
 services:
   paraview:
     image: nvcr.io/nvidia-hpcvis/paraview:egl-py3-5.11.0
@@ -10,16 +15,15 @@ services:
               capabilities: [gpu]
 
     volumes:
-      - ./results:/results
+      - ../results:/results
       - ./scripts:/scripts
 
     environment:
-      CASE_FILE: /results/aircraft/case.foam
+      CASE_FILE: /results/${CASE_NAME:-aircraft}/case.foam
       OUTPUT_DIR: /results
-      FIELD: U
-      SLICE_AXIS: z
+      FIELD: ${FIELD:-U}
+      SLICE_AXIS: ${SLICE_AXIS:-z}
 
-    command: >
-      pvpython /scripts/visualize.py
+    command: pvpython /scripts/visualize.py
 
     shm_size: 8gb
