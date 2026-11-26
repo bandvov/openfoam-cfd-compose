@@ -20,6 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import trimesh
 
 ROOT = Path("/workspace")
@@ -31,8 +32,24 @@ GEOMETRY = Path(os.getenv("GEOMETRY", str(ROOT / "geometry/model2.stl")))
 U_INF = float(os.getenv("SPEED", "30"))
 RHO = float(os.getenv("AIR_DENSITY", "1.225"))
 NU = float(os.getenv("KINEMATIC_VISCOSITY", "1.5e-5"))
-CHORD = float(os.getenv("CHORD", "1.0"))
-AREA = float(os.getenv("WING_AREA", "1.0"))
+
+
+def env(name: str, default: str) -> str:
+    """os.getenv that also treats an empty value (as passed by Compose) as unset."""
+    value = os.getenv(name)
+    return default if value is None or value.strip() == "" else value.strip()
+
+
+# Reference chord (m) and area (m^2) for force coefficients. "auto" computes the
+# mean chord and planform area from the STL (after unit scaling, before pitching).
+CHORD_RAW = env("CHORD", "auto").lower()
+AREA_RAW = env("WING_AREA", "auto").lower()
+CHORD = 0.0 if CHORD_RAW == "auto" else float(CHORD_RAW)
+AREA = 0.0 if AREA_RAW == "auto" else float(AREA_RAW)
+
+# Angle of attack in degrees, positive nose-up. The geometry is pitched about
+# its centre; the free stream always runs along +X.
+ANGLE_OF_ATTACK = float(env("ANGLE_OF_ATTACK", "0"))
 TI = float(os.getenv("TURBULENCE_INTENSITY", "0.01"))
 MAX_ITER = int(os.getenv("MAX_ITER", "3000"))
 # Units of the STL file. MODEL_UNITS picks the factor that converts them to
@@ -55,17 +72,38 @@ _scale_override = os.getenv("MESH_SCALE", "").strip()
 MESH_SCALE = (float(_scale_override) if _scale_override
               else UNIT_TO_METRES[MODEL_UNITS])
 
-# Background mesh controls. These defaults keep the first test mesh modest.
-BACKGROUND_CELLS_PER_LENGTH = float(
-    os.getenv("BACKGROUND_CELLS_PER_LENGTH", "16")
-)
-MAX_BACKGROUND_NX = int(os.getenv("MAX_BACKGROUND_NX", "100"))
-MAX_BACKGROUND_NY = int(os.getenv("MAX_BACKGROUND_NY", "70"))
-MAX_BACKGROUND_NZ = int(os.getenv("MAX_BACKGROUND_NZ", "60"))
-MAX_GLOBAL_CELLS = int(os.getenv("MAX_GLOBAL_CELLS", "2000000"))
-MAX_LOCAL_CELLS = int(os.getenv("MAX_LOCAL_CELLS", "1000000"))
-SURFACE_REFINEMENT_MIN = int(os.getenv("SURFACE_REFINEMENT_MIN", "1"))
-SURFACE_REFINEMENT_MAX = int(os.getenv("SURFACE_REFINEMENT_MAX", "2"))
+# Mesh quality presets. Individual variables below override any preset value.
+#   coarse: quick sanity check (~tens of thousands of cells, no boundary layer)
+#   medium: first usable results (~0.3-1 million cells, 3 prism layers)
+#   fine:   better accuracy (several million cells, 5 prism layers; needs RAM/time)
+MESH_PRESETS = {
+    "coarse": dict(min=1, max=2, layers=0, glob=2_000_000, loc=1_000_000),
+    "medium": dict(min=3, max=4, layers=3, glob=5_000_000, loc=3_000_000),
+    "fine":   dict(min=4, max=5, layers=5, glob=12_000_000, loc=6_000_000),
+}
+MESH_QUALITY = env("MESH_QUALITY", "medium").lower()
+if MESH_QUALITY not in MESH_PRESETS:
+    raise SystemExit(
+        f"ERROR: unknown MESH_QUALITY '{MESH_QUALITY}'. Use coarse, medium or fine.")
+_preset = MESH_PRESETS[MESH_QUALITY]
+
+BACKGROUND_CELLS_PER_LENGTH = float(env("BACKGROUND_CELLS_PER_LENGTH", "16"))
+MAX_BACKGROUND_NX = int(env("MAX_BACKGROUND_NX", "100"))
+MAX_BACKGROUND_NY = int(env("MAX_BACKGROUND_NY", "70"))
+MAX_BACKGROUND_NZ = int(env("MAX_BACKGROUND_NZ", "60"))
+MAX_GLOBAL_CELLS = int(env("MAX_GLOBAL_CELLS", str(_preset["glob"])))
+MAX_LOCAL_CELLS = int(env("MAX_LOCAL_CELLS", str(_preset["loc"])))
+SURFACE_REFINEMENT_MIN = int(env("SURFACE_REFINEMENT_MIN", str(_preset["min"])))
+SURFACE_REFINEMENT_MAX = int(env("SURFACE_REFINEMENT_MAX", str(_preset["max"])))
+# Prism (boundary-layer) cells on the aircraft surface; 0 disables.
+LAYERS = int(env("LAYERS", str(_preset["layers"])))
+# Refinement level of the box around the body and wake; 0 disables.
+WAKE_LEVEL = int(env("WAKE_LEVEL", str(max(SURFACE_REFINEMENT_MAX - 2, 1)
+                                        if SURFACE_REFINEMENT_MAX >= 2 else 0)))
+
+# Parallel solve (decomposePar + mpirun). 1 = serial.
+NPROCS = int(env("NPROCS", "1"))
+MPIRUN_ARGS = env("MPIRUN_ARGS", "--allow-run-as-root --oversubscribe")
 
 
 
@@ -155,6 +193,7 @@ def foam_header(class_name: str, object_name: str) -> str:
 
 
 def prepare_geometry():
+    global CHORD, AREA
     GEOMETRY.parent.mkdir(parents=True, exist_ok=True)
     if GEOMETRY.exists():
         mesh = trimesh.load(GEOMETRY, force="mesh")
@@ -187,7 +226,28 @@ def prepare_geometry():
             f"No STL found at {GEOMETRY}; creating a simple rectangular-wing test geometry.")
         # A basic finite-thickness wing-like box. Replace with your own STL for real work.
         mesh = trimesh.creation.box(
-            extents=[CHORD, max(3.0 * CHORD, 1.0), 0.06 * CHORD])
+            extents=[CHORD or 1.0, max(3.0 * (CHORD or 1.0), 1.0),
+                     0.06 * (CHORD or 1.0)])
+
+    # Planform (top-view) area and mean chord of the un-pitched geometry.
+    planform = 0.5 * float(
+        (np.abs(mesh.face_normals[:, 2]) * mesh.area_faces).sum())
+    span = float(mesh.extents[1])
+    if AREA_RAW == "auto":
+        AREA = planform
+    if CHORD_RAW == "auto":
+        CHORD = planform / span if span > 0 else float(mesh.extents[0])
+    print(f"Reference area: {AREA:.6g} m^2"
+          f"{' (auto, planform)' if AREA_RAW == 'auto' else ''}; "
+          f"reference chord: {CHORD:.6g} m"
+          f"{' (auto, area/span)' if CHORD_RAW == 'auto' else ''}", flush=True)
+
+    if ANGLE_OF_ATTACK != 0.0:
+        pivot = mesh.bounds.mean(axis=0)
+        mesh.apply_transform(trimesh.transformations.rotation_matrix(
+            math.radians(ANGLE_OF_ATTACK), [0, 1, 0], point=pivot))
+        print(f"Pitched geometry by {ANGLE_OF_ATTACK:g} deg (positive = nose up); "
+              "flow stays along +X.", flush=True)
 
     bounds = mesh.bounds.copy()
     centre = bounds.mean(axis=0)
@@ -296,11 +356,43 @@ aircraft.stl
 }}
 """)
 
+    # Box around the body and wake that is refined in the volume.
+    if WAKE_LEVEL > 0:
+        pad = 0.3 * length
+        wx0, wx1 = xmin - pad, xmax + 2.0 * length
+        wy0, wy1 = ymin - pad, ymax + pad
+        wz0, wz1 = zmin - pad, zmax + pad
+        wake_geometry = f"""    wakeBox
+    {{
+        type searchableBox;
+        min ({wx0} {wy0} {wz0});
+        max ({wx1} {wy1} {wz1});
+    }}"""
+        wake_region = f"""        wakeBox
+        {{
+            mode inside;
+            levels ((1e15 {WAKE_LEVEL}));
+        }}"""
+    else:
+        wake_geometry = ""
+        wake_region = ""
+
+    if LAYERS > 0:
+        layers_block = f"""layers
+    {{
+        aircraft
+        {{
+            nSurfaceLayers {LAYERS};
+        }}
+    }}"""
+    else:
+        layers_block = "layers {}"
+
     write("system/snappyHexMeshDict", f"""
 {foam_header("dictionary", "snappyHexMeshDict")}
 castellatedMesh true;
 snap            true;
-addLayers       false;
+addLayers       {str(LAYERS > 0).lower()};
 
 geometry
 {{
@@ -309,6 +401,7 @@ geometry
         type triSurfaceMesh;
         name aircraft;
     }}
+{wake_geometry}
 }};
 
 castellatedMeshControls
@@ -334,7 +427,10 @@ castellatedMeshControls
     }}
 
     resolveFeatureAngle 30;
-    refinementRegions {{}};
+    refinementRegions
+    {{
+{wake_region}
+    }}
 
     // Guaranteed outside the body and inside the upstream part of the domain.
     locationInMesh ({xmin - 2.0 * length} 0 0);
@@ -345,7 +441,7 @@ snapControls
 {{
     nSmoothPatch 3;
     tolerance 2.0;
-    nSolveIter 30;
+    nSolveIter 100;
     nRelaxIter 5;
     nFeatureSnapIter 10;
     implicitFeatureSnap false;
@@ -356,9 +452,9 @@ snapControls
 addLayersControls
 {{
     relativeSizes true;
-    layers {{}};
-    expansionRatio 1.0;
-    finalLayerThickness 0.3;
+    {layers_block}
+    expansionRatio 1.2;
+    finalLayerThickness 0.4;
     minThickness 0.1;
     nGrow 0;
     featureAngle 60;
@@ -369,7 +465,7 @@ addLayersControls
     nSmoothThickness 10;
     maxFaceThicknessRatio 0.5;
     maxThicknessToMedialRatio 0.3;
-    minMedianAxisAngle 90;
+    minMedialAxisAngle 90;
     nBufferCellsNoExtrude 0;
     nLayerIter 50;
 }}
@@ -594,10 +690,65 @@ boundaryField
 """)
 
 
+def require_mesh(after: str) -> None:
+    """Stop with a clear message if a step did not leave a mesh behind."""
+    poly = CASE / "constant" / "polyMesh"
+    missing = [f for f in ("points", "faces", "owner", "neighbour", "boundary")
+               if not (poly / f).is_file()]
+    if missing:
+        listing = sorted(x.name for x in poly.iterdir()) if poly.is_dir() else "no polyMesh directory"
+        raise RuntimeError(
+            f"No valid mesh in constant/polyMesh after {after} (missing: "
+            f"{', '.join(missing)}; found: {listing}). See results/{CASE_NAME}/log.{after.split()[0]}.")
+
+
+def print_summary() -> None:
+    """Print convergence status and the final force coefficients."""
+    try:
+        log_text = (CASE / "log.simpleFoam").read_text(errors="replace")
+        converged = [l.strip() for l in log_text.splitlines()
+                     if "solution converged" in l.lower()]
+        print("\n=== Result summary ===")
+        print(converged[0] if converged else
+              f"Residual targets not met within {MAX_ITER} iterations "
+              "(check log.simpleFoam; the force coefficients may still be "
+              "usable if they have flattened out).")
+
+        files = sorted((CASE / "postProcessing" / "forceCoeffs").glob("*/*.dat"))
+        files = [f for f in files if "coefficient" in f.name.lower()] or files
+        if not files:
+            print("No forceCoeffs output found.")
+            return
+        header, rows = None, []
+        for line in files[-1].read_text().splitlines():
+            if line.startswith("#"):
+                if "Time" in line:
+                    header = line.lstrip("# ").split()
+            elif line.strip():
+                rows.append([float(x) for x in line.split()])
+        if header is None or not rows:
+            print("forceCoeffs file has no data yet.")
+            return
+        data = np.array([r for r in rows if len(r) == len(header)])
+        tail = data[-max(1, len(data) // 10):]
+        print(f"Reference: area {AREA:.4g} m^2, chord {CHORD:.4g} m, "
+              f"U {U_INF:g} m/s, alpha {ANGLE_OF_ATTACK:g} deg")
+        print(f"{'coefficient':<10} {'final':>12} {'mean(last 10%)':>16}")
+        for name in ("Cd", "Cl", "CmPitch", "Cm"):
+            if name in header:
+                i = header.index(name)
+                print(f"{name:<10} {data[-1, i]:>12.5f} {tail[:, i].mean():>16.5f}")
+        print(f"(from {files[-1].relative_to(CASE)})")
+    except Exception as exc:  # noqa: BLE001 - summary is best effort
+        print(f"Could not summarise results: {exc}")
+
+
 def main():
-    if U_INF <= 0 or RHO <= 0 or NU <= 0 or CHORD <= 0 or AREA <= 0:
+    if U_INF <= 0 or RHO <= 0 or NU <= 0 or CHORD < 0 or AREA < 0:
         raise ValueError(
             "SPEED, AIR_DENSITY, KINEMATIC_VISCOSITY, CHORD and WING_AREA must be positive.")
+    if NPROCS < 1 or LAYERS < 0 or WAKE_LEVEL < 0:
+        raise ValueError("NPROCS must be >= 1; LAYERS and WAKE_LEVEL must be >= 0.")
     if not 0 < TI < 1:
         raise ValueError(
             "TURBULENCE_INTENSITY must be a fraction between 0 and 1.")
@@ -619,6 +770,8 @@ def main():
     CASE.mkdir(parents=True)
 
     bounds, ext, length = prepare_geometry()
+    if CHORD <= 0 or AREA <= 0:
+        raise ValueError("CHORD and WING_AREA must be positive (or 'auto').")
     write_case(bounds, ext, length)
 
     print("\n=== Configuration ===", flush=True)
@@ -631,14 +784,32 @@ def main():
     )
     print(f"Maximum global cells: {MAX_GLOBAL_CELLS:,}", flush=True)
     print(f"Maximum simpleFoam iterations: {MAX_ITER:,}", flush=True)
+    print(f"Mesh quality: {MESH_QUALITY}; prism layers: {LAYERS}; "
+          f"wake box level: {WAKE_LEVEL}; angle of attack: {ANGLE_OF_ATTACK:g} deg; "
+          f"processes: {NPROCS}", flush=True)
 
     print("\n=== OpenFOAM pipeline ===", flush=True)
     (CASE / "case.foam").touch()
     run("blockMesh", "log.blockMesh")
+    require_mesh("blockMesh")
     run("surfaceFeatureExtract", "log.surfaceFeatureExtract")
     run("snappyHexMesh -overwrite", "log.snappyHexMesh")
+    require_mesh("snappyHexMesh")
     run("checkMesh", "log.checkMesh")
-    run("simpleFoam", "log.simpleFoam")
+    if NPROCS > 1:
+        write("system/decomposeParDict", f"""
+{foam_header("dictionary", "decomposeParDict")}
+numberOfSubdomains {NPROCS};
+method scotch;
+""")
+        run("decomposePar -force", "log.decomposePar")
+        run(f"mpirun {MPIRUN_ARGS} -np {NPROCS} simpleFoam -parallel",
+            "log.simpleFoam")
+        run("reconstructPar -latestTime", "log.reconstructPar")
+    else:
+        run("simpleFoam", "log.simpleFoam")
+
+    print_summary()
 
     print("\nSimulation finished.")
     print(f"Case and fields: {CASE}")
