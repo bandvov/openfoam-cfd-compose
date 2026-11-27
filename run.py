@@ -14,6 +14,7 @@ The script recentres it around its bounding-box centre.
 from __future__ import annotations
 
 import math
+import re
 import os
 import shutil
 import subprocess
@@ -100,6 +101,12 @@ LAYERS = int(env("LAYERS", str(_preset["layers"])))
 # Refinement level of the box around the body and wake; 0 disables.
 WAKE_LEVEL = int(env("WAKE_LEVEL", str(max(SURFACE_REFINEMENT_MAX - 2, 1)
                                         if SURFACE_REFINEMENT_MAX >= 2 else 0)))
+
+# Keep only the last N written time directories (0 = keep all).
+PURGE_WRITE = int(env("PURGE_WRITE", "0"))
+# RESTART=1 continues the existing case from its latest saved time instead of
+# rebuilding it: the mesh and settings are reused and MAX_ITER more iterations run.
+RESTART = env("RESTART", "0").lower() in ("1", "true", "yes", "on")
 
 # Parallel solve (decomposePar + mpirun). 1 = serial.
 NPROCS = int(env("NPROCS", "1"))
@@ -505,7 +512,7 @@ endTime {MAX_ITER};
 deltaT 1;
 writeControl timeStep;
 writeInterval {max(100, MAX_ITER // 5)};
-purgeWrite 0;
+purgeWrite {PURGE_WRITE};
 writeFormat ascii;
 writePrecision 8;
 writeCompression off;
@@ -690,6 +697,63 @@ boundaryField
 """)
 
 
+def latest_time_dir() -> tuple[float, str]:
+    """Latest numeric time directory in the case, as (value, directory name)."""
+    best = (-1.0, "")
+    for d in CASE.iterdir():
+        if d.is_dir():
+            try:
+                value = float(d.name)
+            except ValueError:
+                continue
+            if value > best[0]:
+                best = (value, d.name)
+    return best
+
+
+def prepare_restart() -> str:
+    """Point the existing case's controlDict at its latest time. Returns the log suffix."""
+    global CHORD, AREA, U_INF
+    if not (CASE / "constant" / "polyMesh" / "faces").is_file():
+        raise RuntimeError(
+            f"RESTART=1 needs an existing case with a mesh in {CASE}. "
+            "Run once without RESTART first.")
+    value, name = latest_time_dir()
+    if value <= 0:
+        raise RuntimeError(
+            f"RESTART=1 found no saved time after 0 in {CASE}; nothing to continue from.")
+
+    control = CASE / "system" / "controlDict"
+    text = control.read_text()
+    end_time = value + MAX_ITER
+    end_text = f"{int(end_time)}" if end_time == int(end_time) else f"{end_time:g}"
+    for pattern, replacement in (
+        (r"^startFrom\s+\w+;", "startFrom latestTime;"),
+        (r"^endTime\s+[^;]+;", f"endTime {end_text};"),
+        (r"^purgeWrite\s+\d+;", f"purgeWrite {PURGE_WRITE};"),
+    ):
+        text, count = re.subn(pattern, replacement, text, count=1, flags=re.M)
+        if count != 1:
+            raise RuntimeError(f"Could not update '{pattern}' in {control}")
+    control.write_text(text)
+
+    # Reference values for the summary come from the existing case.
+    for key in ("lRef", "Aref", "magUInf"):
+        match = re.search(rf"^\s*{key}\s+([^;\s]+);", text, flags=re.M)
+        if match:
+            value_f = float(match.group(1))
+            if key == "lRef":
+                CHORD = value_f
+            elif key == "Aref":
+                AREA = value_f
+            else:
+                U_INF = value_f
+    print(f"Restarting from time {name}; running up to {end_text} "
+          f"({MAX_ITER} more iterations). Mesh and settings are reused; only "
+          "MAX_ITER, NPROCS and PURGE_WRITE take effect.", flush=True)
+    return name
+
+
 def require_mesh(after: str) -> None:
     """Stop with a clear message if a step did not leave a mesh behind."""
     poly = CASE / "constant" / "polyMesh"
@@ -702,10 +766,10 @@ def require_mesh(after: str) -> None:
             f"{', '.join(missing)}; found: {listing}). See results/{CASE_NAME}/log.{after.split()[0]}.")
 
 
-def print_summary() -> None:
+def print_summary(log_name: str = "log.simpleFoam") -> None:
     """Print convergence status and the final force coefficients."""
     try:
-        log_text = (CASE / "log.simpleFoam").read_text(errors="replace")
+        log_text = (CASE / log_name).read_text(errors="replace")
         converged = [l.strip() for l in log_text.splitlines()
                      if "solution converged" in l.lower()]
         print("\n=== Result summary ===")
@@ -714,7 +778,14 @@ def print_summary() -> None:
               "(check log.simpleFoam; the force coefficients may still be "
               "usable if they have flattened out).")
 
-        files = sorted((CASE / "postProcessing" / "forceCoeffs").glob("*/*.dat"))
+        def _start_time(path):
+            try:
+                return float(path.parent.name)
+            except ValueError:
+                return -1.0
+
+        files = sorted((CASE / "postProcessing" / "forceCoeffs").glob("*/*.dat"),
+                       key=_start_time)
         files = [f for f in files if "coefficient" in f.name.lower()] or files
         if not files:
             print("No forceCoeffs output found.")
@@ -763,6 +834,24 @@ def main():
         raise ValueError("Mesh cell limits must be positive.")
     if SURFACE_REFINEMENT_MIN < 0 or SURFACE_REFINEMENT_MAX < SURFACE_REFINEMENT_MIN:
         raise ValueError("Invalid surface refinement levels.")
+
+    if RESTART:
+        if not CASE.exists():
+            raise RuntimeError(
+                f"RESTART=1 but there is no case at {CASE}. Run once without RESTART first.")
+        restart_name = prepare_restart()
+        log_name = f"log.simpleFoam.restart-{restart_name}"
+        print("\n=== OpenFOAM pipeline (restart) ===", flush=True)
+        if NPROCS > 1:
+            run("decomposePar -force -latestTime", "log.decomposePar")
+            run(f"mpirun {MPIRUN_ARGS} -np {NPROCS} simpleFoam -parallel", log_name)
+            run("reconstructPar -latestTime", "log.reconstructPar")
+        else:
+            run("simpleFoam", log_name)
+        print_summary(log_name)
+        print("\nRestart finished.")
+        print(f"Open results/{CASE_NAME}/case.foam in ParaView to inspect the fields.")
+        return
 
     if CASE.exists():
         print(f"Removing previous case directory: {CASE}", flush=True)

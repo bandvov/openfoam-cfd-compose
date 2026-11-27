@@ -29,6 +29,23 @@ in ParaView to inspect fields. Force coefficient history is under
 `postProcessing/forceCoeffs/`. When the solver finishes, the container log prints a
 summary with convergence status and the final Cd, Cl and CmPitch.
 
+## Saved time folders, restart, disk space
+
+`simpleFoam` is a steady solver, so the numbered folders in `results/<CASE_NAME>/`
+(`400`, `800`, ...) are snapshots of the full solution at that iteration, written
+every `max(100, MAX_ITER/5)` iterations. `0` holds the initial and boundary
+conditions. The last folder is the final solution (its number is the iteration where
+the run converged, or `MAX_ITER`).
+
+- **Continue a run:** set `RESTART=1` (and `MAX_ITER` to the number of *additional*
+  iterations) and run `docker compose up` again. The existing mesh, settings and
+  latest solution are reused; nothing is deleted. The log goes to
+  `log.simpleFoam.restart-<start time>` and the summary reports the new segment.
+  Only `MAX_ITER`, `NPROCS` and `PURGE_WRITE` take effect on a restart. To change
+  speed, angle of attack or the mesh, run again with `RESTART=0`; that deletes the
+  case and starts from scratch.
+- **Save disk space:** `PURGE_WRITE=2` keeps only the last two written snapshots.
+
 ## Mesh quality, angle of attack, speed
 
 - `MESH_QUALITY=coarse|medium|fine` (default `medium`). `coarse` is a quick

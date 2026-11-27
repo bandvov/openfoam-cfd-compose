@@ -124,6 +124,7 @@ def main():
         bar.Title = "Surface kinematic pressure p/rho [m^2/s^2]"
         bar.ComponentTitle = ""
 
+        Render(view)
         view.CameraParallelProjection = 0
         d = 2.2 * size
         view.CameraFocalPoint = [cx, cy, cz]
@@ -171,6 +172,9 @@ def main():
         body_display.DiffuseColor = [0.15, 0.15, 0.15]
 
     # ---- Camera ------------------------------------------------------
+    # paraview.simple resets the camera on the first Render(). Do that now, so the
+    # framing below is not overwritten by the later screenshot render.
+    Render(view)
     view.CameraParallelProjection = 1
     if axis == "z":      # top view: X right, Y up
         view.CameraFocalPoint = [cx + 0.8 * bx, cy, 0]
@@ -195,7 +199,7 @@ def main():
         half_h = max(vert * 1.2, horiz * 3.0 / ASPECT / 2.0, 0.25 * size)
         view.CameraParallelScale = half_h
 
-    Render()
+    Render(view)
     out = os.path.join(OUTPUT_DIR, f"{CASE_NAME()}_{field}_{axis}.png")
     SaveScreenshot(out, view, ImageResolution=[IMAGE_WIDTH, IMAGE_HEIGHT])
     log(f"Screenshot saved: {out}")
