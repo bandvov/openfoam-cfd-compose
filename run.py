@@ -766,6 +766,17 @@ def require_mesh(after: str) -> None:
             f"{', '.join(missing)}; found: {listing}). See results/{CASE_NAME}/log.{after.split()[0]}.")
 
 
+def compute_wall_shear() -> None:
+    """Write the wallShearStress field into every saved time (used for surface
+    streamlines in ParaView). Best effort: a failure does not stop the run."""
+    try:
+        run("simpleFoam -postProcess -func wallShearStress -noZero",
+            "log.wallShearStress")
+    except subprocess.CalledProcessError:
+        print("WARNING: could not compute wallShearStress; surface streamlines "
+              "will be skipped in ParaView (see log.wallShearStress).", flush=True)
+
+
 def print_summary(log_name: str = "log.simpleFoam") -> None:
     """Print convergence status and the final force coefficients."""
     try:
@@ -848,6 +859,7 @@ def main():
             run("reconstructPar -latestTime", "log.reconstructPar")
         else:
             run("simpleFoam", log_name)
+        compute_wall_shear()
         print_summary(log_name)
         print("\nRestart finished.")
         print(f"Open results/{CASE_NAME}/case.foam in ParaView to inspect the fields.")
@@ -898,6 +910,7 @@ method scotch;
     else:
         run("simpleFoam", "log.simpleFoam")
 
+    compute_wall_shear()
     print_summary()
 
     print("\nSimulation finished.")

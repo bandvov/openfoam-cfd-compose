@@ -4,6 +4,8 @@
 FIELD       U      velocity magnitude on a slice
             p      kinematic pressure (p/rho) on a slice
             psurf  kinematic pressure on the aircraft surface (3D view)
+            streamlines  3D streamlines coloured by speed, plus streamlines drawn on
+                         the aircraft surface from the wall shear stress (3D view)
 SLICE_AXIS  x | y | z   slice plane normal (ignored for psurf)
               z = top view of the mid-height plane, y = side view of the mid-span plane
 ZOOM        body (default) frames the aircraft and its wake; full shows the whole domain
@@ -48,6 +50,110 @@ def find_body_region(reader):
     return None
 
 
+def pick_preset(lut, names=("Turbo", "Jet", "Cool to Warm")):
+    for name in names:
+        try:
+            if lut.ApplyPreset(name, True):
+                return name
+        except Exception:
+            continue
+    return None
+
+
+def render_streamlines(view, reader, body, latest, bb):
+    """Airliner-style picture: 3D streamlines coloured by speed, plus streamlines
+    on the aircraft surface following the wall shear stress."""
+    bx, by, bz = bb[1] - bb[0], bb[3] - bb[2], bb[5] - bb[4]
+    cx, cy, cz = (bb[0] + bb[1]) / 2, (bb[2] + bb[3]) / 2, (bb[4] + bb[5]) / 2
+    size = max(bx, by, bz)
+    view.Background = [0.32, 0.33, 0.40]
+    view.CameraParallelProjection = 0
+
+    # --- 3D streamlines from a seed grid upstream of the body ----------
+    x_seed = bb[0] - 0.25 * size
+    seeds = Plane(registrationName="StreamSeeds")
+    seeds.Origin = [x_seed, cy - 0.9 * by - 0.1 * size, cz - 0.30 * size]
+    seeds.Point1 = [x_seed, cy + 0.9 * by + 0.1 * size, cz - 0.30 * size]
+    seeds.Point2 = [x_seed, cy - 0.9 * by - 0.1 * size, cz + 0.30 * size]
+    seeds.XResolution = 40
+    seeds.YResolution = 14
+
+    domain = reader.GetDataInformation().GetBounds()
+    tracer = StreamTracerWithCustomSource(
+        registrationName="Streamlines", Input=reader, SeedSource=seeds)
+    tracer.Vectors = ["POINTS", "U"]
+    tracer.IntegrationDirection = "FORWARD"
+    tracer.MaximumStreamlineLength = min(domain[1] - domain[0], 8.0 * size)
+    tracer.UpdatePipeline(time=latest)
+
+    tubes = Tube(registrationName="StreamTubes", Input=tracer)
+    tubes.Radius = 0.0025 * size
+    tubes.UpdatePipeline(time=latest)
+    tube_display = Show(tubes, view)
+    ColorBy(tube_display, ("POINTS", "U", "Magnitude"))
+    lut = GetColorTransferFunction("U")
+    pick_preset(lut)
+    tube_display.RescaleTransferFunctionToDataRange(True, False)
+    tube_display.SetScalarBarVisibility(view, True)
+    bar = GetScalarBar(lut, view)
+    bar.Title = "Velocity magnitude [m/s]"
+    bar.ComponentTitle = ""
+
+    # --- Aircraft surface ----------------------------------------------
+    body_display = Show(body, view)
+    body_display.Representation = "Surface"
+    ColorBy(body_display, None)
+    body_display.AmbientColor = [0.10, 0.18, 0.55]
+    body_display.DiffuseColor = [0.10, 0.18, 0.55]
+
+    # --- Surface streamlines from the wall shear stress ----------------
+    try:
+        names = list(body.PointData.keys())
+    except Exception:
+        names = []
+    if "wallShearStress" in names:
+        try:
+            mask = MaskPoints(registrationName="SurfaceSeeds", Input=body)
+            mask.OnRatio = 1
+            mask.MaximumNumberofPoints = 4000
+            mask.RandomSampling = 1
+            mask.GenerateVertices = 1
+            mask.SingleVertexPerCell = 0
+            surface = StreamTracerWithCustomSource(
+                registrationName="SurfaceStreamlines", Input=body, SeedSource=mask)
+            surface.Vectors = ["POINTS", "wallShearStress"]
+            surface.IntegrationDirection = "BOTH"
+            surface.MaximumStreamlineLength = 3.0 * size
+            surface.UpdatePipeline(time=latest)
+            s_display = Show(surface, view)
+            s_display.LineWidth = 1.5
+            s_display.RenderLinesAsTubes = 1
+            ColorBy(s_display, ("POINTS", "wallShearStress", "Magnitude"))
+            wss_lut = GetColorTransferFunction("wallShearStress")
+            pick_preset(wss_lut)
+            s_display.RescaleTransferFunctionToDataRange(True, False)
+            s_display.SetScalarBarVisibility(view, False)
+            log("Surface streamlines added")
+        except Exception as error:  # noqa: BLE001
+            log(f"Surface streamlines skipped: {error}")
+    else:
+        log("No wallShearStress field found; run the solver step again to write it. "
+            "Showing the 3D streamlines only.")
+
+    # --- Camera: raised, front-left three-quarter view -----------------
+    Render(view)
+    d = 2.6 * size
+    fx, fy, fz = cx + 0.9 * bx, cy, cz
+    view.CameraFocalPoint = [fx, fy, fz]
+    view.CameraPosition = [fx - 0.9 * d, fy - 1.1 * d, fz + 0.9 * d]
+    view.CameraViewUp = [0, 0, 1]
+    Render(view)
+    out = os.path.join(OUTPUT_DIR, f"{CASE_NAME()}_streamlines.png")
+    SaveScreenshot(out, view, ImageResolution=[IMAGE_WIDTH, IMAGE_HEIGHT])
+    log(f"Screenshot saved: {out}")
+    log("=== SUCCESS ===")
+
+
 def main():
     log("=== ParaView CFD visualization ===")
 
@@ -58,7 +164,7 @@ def main():
     axis = SLICE_AXIS if SLICE_AXIS in ("x", "y", "z") else "z"
     if axis != SLICE_AXIS:
         log(f"Unknown SLICE_AXIS '{SLICE_AXIS}', using z")
-    field = FIELD if FIELD in ("U", "p", "psurf") else "U"
+    field = FIELD if FIELD in ("U", "p", "psurf", "streamlines") else "U"
     if field != FIELD:
         log(f"Unknown FIELD '{FIELD}', using U")
 
@@ -78,7 +184,13 @@ def main():
         if region:
             body = OpenFOAMReader(registrationName="AircraftSurface", FileName=CASE_FILE)
             body.MeshRegions = [region]
-            body.CellArrays = ["p"]
+            try:
+                body.UpdatePipelineInformation()
+                available = list(body.CellArrays.Available)
+            except Exception:
+                available = []
+            wanted = [a for a in ("p", "wallShearStress") if a in available] or ["p"]
+            body.CellArrays = wanted
             body.UpdatePipeline(time=latest)
             log(f"Aircraft surface region: {region}")
         else:
@@ -87,8 +199,8 @@ def main():
         body = None
         log(f"Could not load aircraft surface: {error}")
 
-    if field == "psurf" and body is None:
-        raise RuntimeError("psurf needs the aircraft surface, which could not be loaded")
+    if field in ("psurf", "streamlines") and body is None:
+        raise RuntimeError(f"{field} needs the aircraft surface, which could not be loaded")
 
     # ---- View --------------------------------------------------------
     view = GetActiveViewOrCreate("RenderView")
@@ -136,6 +248,11 @@ def main():
         SaveScreenshot(out, view, ImageResolution=[IMAGE_WIDTH, IMAGE_HEIGHT])
         log(f"Screenshot saved: {out}")
         log("=== SUCCESS ===")
+        return
+
+    # ---- Streamlines view (3D streamlines + surface streamlines) -----
+    if field == "streamlines":
+        render_streamlines(view, reader, body, latest, bb)
         return
 
     # ---- Slice view -------------------------------------------------

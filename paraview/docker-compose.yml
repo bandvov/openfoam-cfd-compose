@@ -1,7 +1,8 @@
 # Renders images from the CFD results. Run the solver first
 # (docker compose up --build in the repo root); it writes ../results/<CASE_NAME>/.
 # Images: <case>_U_z.png (top view), <case>_U_y.png and <case>_p_y.png (side view,
-# mid-span) and <case>_psurf.png (surface pressure), saved in ../results/.
+# mid-span), <case>_psurf.png (surface pressure) and <case>_streamlines.png
+# (3D + surface streamlines), saved in ../results/.
 # CASE_NAME / ZOOM come from the shell or a paraview/.env file, e.g.
 #   CASE_NAME=run2 ZOOM=full docker compose up
 # Needs an NVIDIA GPU + NVIDIA Container Toolkit and access to nvcr.io.
@@ -29,7 +30,7 @@ services:
       - sh
       - -c
       - |
-        for v in "U z" "U y" "p y" "psurf z"; do
+        for v in "U z" "U y" "p y" "psurf z" "streamlines z"; do
           set -- $$v
           FIELD=$$1 SLICE_AXIS=$$2 pvpython /scripts/visualize.py || exit 1
         done

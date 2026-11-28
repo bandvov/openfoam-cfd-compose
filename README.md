@@ -104,6 +104,17 @@ the aircraft surface). The views are zoomed on the aircraft; use `ZOOM=full` for
 whole domain and `CASE_NAME=<name>` for another case. `p` is kinematic pressure
 (p/rho).
 
+### Streamline picture
+
+`<case>_streamlines.png` is an airliner-style image: 3D streamlines from a seed grid
+upstream, drawn as tubes coloured by speed, plus streamlines on the aircraft surface
+that follow the wall shear stress (they show the near-wall flow direction and
+separation). The solver step now also writes the `wallShearStress` field
+(`log.wallShearStress`). For a case you already solved, run once with
+`RESTART=1 MAX_ITER=1` to write that field without re-solving, then run the ParaView
+compose again. If the field is missing, the image still shows the 3D streamlines.
+The picture is only as good as the mesh: a coarse mesh gives rough surface lines.
+
 ## Troubleshooting
 
 - `Could not find OpenFOAM's etc/bashrc`: set `OPENFOAM_BASHRC` to its path in the image.
